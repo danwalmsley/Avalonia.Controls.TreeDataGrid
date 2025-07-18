@@ -31,6 +31,13 @@ namespace Avalonia.Controls.Primitives
                 o => o.Items,
                 (o, v) => o.Items = v);
 #pragma warning restore AVP1002
+
+        /// <summary>
+        /// Defines the <see cref="CacheLength"/> property.
+        /// </summary>
+        public static readonly StyledProperty<double> CacheLengthProperty =
+            AvaloniaProperty.Register<TreeDataGridPresenterBase<TItem>, double>(nameof(CacheLength), 0.0,
+                validate: v => v is >= 0 and <= 2);
         private static readonly Rect s_invalidViewport = new(double.PositiveInfinity, double.PositiveInfinity, 0, 0);
         private readonly Action<Control, int> _recycleElement;
         private readonly Action<Control> _recycleElementOnItemRemoved;
@@ -40,6 +47,10 @@ namespace Avalonia.Controls.Primitives
         private TreeDataGridElementFactory? _elementFactory;
         private bool _isInLayout;
         private bool _isWaitingForViewportUpdate;
+        private double _bufferFactor;
+        private bool _hasReachedStart;
+        private bool _hasReachedEnd;
+        private Rect _extendedViewport;
         private IReadOnlyList<TItem>? _items;
         private bool _isSubscribedToItemChanges;
         private RealizedStackElements? _measureElements;
@@ -49,11 +60,18 @@ namespace Avalonia.Controls.Primitives
         private Control? _focusedElement;
         private int _focusedIndex = -1;
 
+        static TreeDataGridPresenterBase()
+        {
+            CacheLengthProperty.Changed.AddClassHandler<TreeDataGridPresenterBase<TItem>>(static (x, e) => x.OnCacheLengthChanged(e));
+        }
+
         public TreeDataGridPresenterBase()
         {
             _recycleElement = RecycleElement;
             _recycleElementOnItemRemoved = RecycleElementOnItemRemoved;
             _updateElementIndex = UpdateElementIndex;
+
+            _bufferFactor = Math.Max(0, CacheLength);
         }
 
         public TreeDataGridElementFactory? ElementFactory
@@ -86,6 +104,23 @@ namespace Avalonia.Controls.Primitives
         }
 
         internal IReadOnlyList<Control?> RealizedElements => _realizedElements?.Elements ?? Array.Empty<Control>();
+
+        /// <summary>
+        /// Gets or sets the cache length factor used for virtualization buffering.
+        /// </summary>
+        /// <remarks>
+        /// A value of 0.5 means half the viewport size will be buffered on each side.
+        /// </remarks>
+        public double CacheLength
+        {
+            get => GetValue(CacheLengthProperty);
+            set => SetValue(CacheLengthProperty, value);
+        }
+
+        /// <summary>
+        /// Returns the extended viewport that includes cached elements.
+        /// </summary>
+        internal Rect ExtendedViewPort => _extendedViewport;
 
         protected abstract Orientation Orientation { get; }
         protected Rect Viewport { get; private set; } = s_invalidViewport;
@@ -382,7 +417,8 @@ namespace Avalonia.Controls.Primitives
                             new Rect(u, 0, sizeU, finalSize.Height) :
                             new Rect(0, u, finalSize.Width, sizeU);
                         rect = ArrangeElement(i + _realizedElements.FirstIndex, e, rect);
-                        _scrollViewer?.RegisterAnchorCandidate(e);
+                        if (Viewport.Intersects(rect))
+                            _scrollViewer?.RegisterAnchorCandidate(e);
                         u += orientation == Orientation.Horizontal ? rect.Width : rect.Height;
                     }
                 }
@@ -442,23 +478,101 @@ namespace Avalonia.Controls.Primitives
             var vertical = Orientation == Orientation.Vertical;
             var oldViewportStart = vertical ? Viewport.Top : Viewport.Left;
             var oldViewportEnd = vertical ? Viewport.Bottom : Viewport.Right;
+            var oldExtendedViewportStart = vertical ? _extendedViewport.Top : _extendedViewport.Left;
+            var oldExtendedViewportEnd = vertical ? _extendedViewport.Bottom : _extendedViewport.Right;
 
             // We sometimes get sent a viewport of 0,0 because the EffectiveViewportChanged event
             // is being raised when the parent control hasn't yet been arranged. This is a bug in
             // Avalonia, but we can work around it by forcing MeasureOverride to estimate the
             // viewport.
-            Viewport = e.EffectiveViewport.Size == default ? 
+            Viewport = e.EffectiveViewport.Size == default ?
                 s_invalidViewport :
                 Intersect(e.EffectiveViewport, new(Bounds.Size));
 
             _isWaitingForViewportUpdate = false;
 
+            var viewportSize = vertical ? Viewport.Height : Viewport.Width;
+            var bufferSize = viewportSize * _bufferFactor;
+
+            var extendedViewportStart = vertical ?
+                Math.Max(0, Viewport.Top - bufferSize) :
+                Math.Max(0, Viewport.Left - bufferSize);
+
+            var extendedViewportEnd = vertical ?
+                Math.Min(Bounds.Height, Viewport.Bottom + bufferSize) :
+                Math.Min(Bounds.Width, Viewport.Right + bufferSize);
+
+            if (vertical)
+            {
+                var spaceAbove = Viewport.Top - bufferSize;
+                var spaceBelow = Bounds.Height - (Viewport.Bottom + bufferSize);
+
+                if (spaceAbove < 0 && spaceBelow >= 0)
+                    extendedViewportEnd = Math.Min(Bounds.Height, extendedViewportEnd + Math.Abs(spaceAbove));
+                if (spaceAbove >= 0 && spaceBelow < 0)
+                    extendedViewportStart = Math.Max(0, extendedViewportStart - Math.Abs(spaceBelow));
+            }
+            else
+            {
+                var spaceLeft = Viewport.Left - bufferSize;
+                var spaceRight = Bounds.Width - (Viewport.Right + bufferSize);
+
+                if (spaceLeft < 0 && spaceRight >= 0)
+                    extendedViewportEnd = Math.Min(Bounds.Width, extendedViewportEnd + Math.Abs(spaceLeft));
+                if (spaceLeft >= 0 && spaceRight < 0)
+                    extendedViewportStart = Math.Max(0, extendedViewportStart - Math.Abs(spaceRight));
+            }
+
+            Rect extendedViewPort = vertical ?
+                new Rect(Viewport.X, extendedViewportStart, Viewport.Width, extendedViewportEnd - extendedViewportStart) :
+                new Rect(extendedViewportStart, Viewport.Y, extendedViewportEnd - extendedViewportStart, Viewport.Height);
+
             var newViewportStart = vertical ? Viewport.Top : Viewport.Left;
             var newViewportEnd = vertical ? Viewport.Bottom : Viewport.Right;
+            var newExtendedViewportStart = vertical ? extendedViewPort.Top : extendedViewPort.Left;
+            var newExtendedViewportEnd = vertical ? extendedViewPort.Bottom : extendedViewPort.Right;
+
+            var needsMeasure = false;
 
             if (!MathUtilities.AreClose(oldViewportStart, newViewportStart) ||
                 !MathUtilities.AreClose(oldViewportEnd, newViewportEnd))
             {
+                if (newViewportStart < oldExtendedViewportStart ||
+                    newViewportEnd > oldExtendedViewportEnd)
+                {
+                    needsMeasure = true;
+                }
+                else if (!MathUtilities.AreClose(oldExtendedViewportStart, newExtendedViewportStart) ||
+                         !MathUtilities.AreClose(oldExtendedViewportEnd, newExtendedViewportEnd))
+                {
+                    var nearingEdge = false;
+
+                    if (_realizedElements != null)
+                    {
+                        if (newViewportStart < oldViewportStart &&
+                            newViewportStart - newExtendedViewportStart < bufferSize)
+                        {
+                            nearingEdge = !_hasReachedStart;
+                        }
+
+                        if (newViewportEnd > oldViewportEnd &&
+                            newExtendedViewportEnd - newViewportEnd < bufferSize)
+                        {
+                            nearingEdge = !_hasReachedEnd;
+                        }
+                    }
+                    else
+                    {
+                        nearingEdge = true;
+                    }
+
+                    needsMeasure = nearingEdge;
+                }
+            }
+
+            if (needsMeasure)
+            {
+                _extendedViewport = extendedViewPort;
                 InvalidateMeasure();
             }
         }
@@ -499,6 +613,9 @@ namespace Avalonia.Controls.Primitives
             var horizontal = Orientation == Orientation.Horizontal;
             var u = viewport.anchorU;
 
+            _hasReachedStart = false;
+            _hasReachedEnd = false;
+
             // If the anchor element is at the beginning of, or before, the start of the viewport
             // then we can recycle all elements before it.
             if (u <= viewport.anchorU)
@@ -520,6 +637,8 @@ namespace Avalonia.Controls.Primitives
                 u += sizeU;
                 ++index;
             } while (u < viewport.viewportUEnd && index < items.Count);
+
+            _hasReachedEnd = index >= items.Count;
 
             // Store the last index and end U position for the desired size calculation.
             viewport.lastIndex = index - 1;
@@ -547,6 +666,8 @@ namespace Avalonia.Controls.Primitives
                 --index;
             }
 
+            _hasReachedStart = index < 0;
+
             // We can now recycle elements before the first element.
             _realizedElements.RecycleElementsBefore(index + 1, _recycleElement);
         }
@@ -571,7 +692,8 @@ namespace Avalonia.Controls.Primitives
 
             // If the control has not yet been laid out then the effective viewport won't have been set.
             // Try to work it out from an ancestor control.
-            var viewport = Viewport != s_invalidViewport ? Viewport : EstimateViewport(availableSize);
+            var viewport = _extendedViewport != default ? _extendedViewport :
+                (Viewport != s_invalidViewport ? Viewport : EstimateViewport(availableSize));
 
             // Get the viewport in the orientation direction.
             var viewportStart = Orientation == Orientation.Horizontal ? viewport.X : viewport.Y;
@@ -779,6 +901,14 @@ namespace Avalonia.Controls.Primitives
             RecycleElement(_focusedElement, _focusedIndex);
             _focusedElement = null;
             _focusedIndex = -1;
+        }
+
+        private void OnCacheLengthChanged(AvaloniaPropertyChangedEventArgs e)
+        {
+            var newValue = e.GetNewValue<double>();
+            _bufferFactor = newValue;
+
+            InvalidateMeasure();
         }
 
         private static bool HasInfinity(Size s) => double.IsInfinity(s.Width) || double.IsInfinity(s.Height);
